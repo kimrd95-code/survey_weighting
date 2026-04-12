@@ -45,7 +45,7 @@ def _init_session() -> None:
         "rosstat_name": None,
         "weights": None,
         "preview_df": None,
-        "merge_map": {},
+        "merge_edges": [],
         "mode1_recalc": None,
         "mode2_params": None,
         "preview_mode": None,
@@ -184,21 +184,59 @@ def _pick_target_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def apply_merge_stratum(sk: pd.Series, merge_map: dict[str, str]) -> pd.Series:
-    if not merge_map:
-        return sk.astype(str).copy()
-    out = sk.astype(str).copy()
-    for _ in range(100):
-        changed = False
-        for a, b in merge_map.items():
-            sa, sb = str(a), str(b)
-            mask = out == sa
-            if mask.any():
-                out.loc[mask] = sb
-                changed = True
-        if not changed:
-            break
+NO_MERGE_STRATUM = "— Не объединять —"
+
+
+def merge_edges_list_to_set(edges: list | None) -> set[frozenset[str]]:
+    out: set[frozenset[str]] = set()
+    for e in edges or []:
+        if len(e) >= 2:
+            out.add(frozenset({str(e[0]), str(e[1])}))
     return out
+
+
+class _UnionFindStrata:
+    def __init__(self, nodes: set[str]):
+        self.parent = {x: x for x in nodes}
+
+    def find(self, x: str) -> str:
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def apply_merge_edges(sk: pd.Series, merge_edges: list | None) -> pd.Series:
+    """Объединяет страты по рёбрам; имя группы — «A + B + …» (порядок по natural_sort_key)."""
+    edge_set = merge_edges_list_to_set(merge_edges)
+    if not edge_set:
+        return sk.astype(str).copy()
+    sks = sk.astype(str)
+    nodes: set[str] = set(sks.unique())
+    for p in edge_set:
+        nodes |= set(p)
+    uf = _UnionFindStrata(nodes)
+    for p in edge_set:
+        a, b = tuple(p)
+        uf.union(a, b)
+    root_members: dict[str, list[str]] = {}
+    for n in nodes:
+        r = uf.find(n)
+        root_members.setdefault(r, []).append(n)
+    label_for: dict[str, str] = {}
+    for members in root_members.values():
+        if len(members) == 1:
+            m0 = members[0]
+            label_for[m0] = m0
+        else:
+            lbl = " + ".join(sorted(members, key=natural_sort_key))
+            for m in members:
+                label_for[m] = lbl
+    return sks.map(lambda v: label_for.get(v, v))
 
 
 def build_stratum_key(df: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -337,7 +375,7 @@ def mode1_matrix_compute(
     rosstat: pd.DataFrame,
     survey_row_cols: list[str],
     survey_col_col: str,
-    merge_map: dict[str, str],
+    merge_edges: list | None,
     exclude_rows: list[str],
     exclude_cols: list[str],
 ) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str, list[str], list[str]]:
@@ -359,7 +397,7 @@ def mode1_matrix_compute(
     d["_kr"] = build_stratum_key(d, survey_row_cols).map(normalize_key)
     d["_kc"] = d[survey_col_col].map(normalize_key)
     base_sk = build_stratum_key(d, survey_row_cols + [survey_col_col])
-    d["_sk"] = apply_merge_stratum(base_sk, merge_map)
+    d["_sk"] = apply_merge_edges(base_sk, merge_edges)
 
     jt = joint.groupby(["_kr", "_kc"], dropna=False)["count"].sum()
     pt_map = {k: float(v) / float(total_j) for k, v in jt.items()}
@@ -392,7 +430,7 @@ def mode1_table_compute(
     rosstat: pd.DataFrame,
     weight_vars: list[str],
     survey_col_map: dict[str, str],
-    merge_map: dict[str, str],
+    merge_edges: list | None,
     exclude_values: dict[str, list[str]],
 ) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str, list[str], list[str]]:
     warns: list[str] = []
@@ -457,7 +495,7 @@ def mode1_table_compute(
         pt_map = {k: float(v) / s_pt for k, v in pt_map.items()}
 
     jkeys = set(pt_map.keys())
-    d["_sk"] = apply_merge_stratum(build_stratum_key(d, [survey_col_map[v] for v in weight_vars]), merge_map)
+    d["_sk"] = apply_merge_edges(build_stratum_key(d, [survey_col_map[v] for v in weight_vars]), merge_edges)
 
     stratum_per_row = d["_sk"].astype(str).tolist()
     row_cell_keys = [tuple(d.iloc[i][nc] for nc in norm_cols) for i in range(n)]
@@ -529,7 +567,7 @@ def mode2_compute(
     target_cat: str,
     weighted_cat: str,
     soc_dem: list[str],
-    merge_map: dict[str, str],
+    merge_edges: list | None,
     na_is_category: bool,
 ) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str]:
     if not soc_dem:
@@ -557,7 +595,7 @@ def mode2_compute(
     is_w = d["_split_v"] == wgt_l
 
     sk = build_stratum_key(d, soc_dem)
-    sk = apply_merge_stratum(sk, merge_map)
+    sk = apply_merge_edges(sk, merge_edges)
     n = len(d)
     n_t = int(is_t.sum())
     n_w = int(is_w.sum())
@@ -635,6 +673,36 @@ def natural_sort_key(s: str) -> tuple[Any, ...]:
         else:
             out.append(p)
     return tuple(out)
+
+
+def merge_edges_set_to_list(edge_set: set[frozenset[str]]) -> list[list[str]]:
+    return [sorted(list(p), key=natural_sort_key) for p in edge_set]
+
+
+def atoms_from_display(label: str) -> list[str]:
+    return [p.strip() for p in str(label).split(" + ") if p.strip()]
+
+
+def partner_atoms_for_display(a_display: str, edge_set: set[frozenset[str]]) -> set[str]:
+    pa = set(atoms_from_display(a_display))
+    out: set[str] = set()
+    for e in edge_set:
+        el = list(e)
+        if len(el) != 2:
+            continue
+        u, v = el[0], el[1]
+        if u in pa:
+            out.add(v)
+        if v in pa:
+            out.add(u)
+    return out
+
+
+def display_for_atom(atom: str, all_strata: list[str]) -> str:
+    for s in all_strata:
+        if atom in atoms_from_display(s):
+            return s
+    return ""
 
 
 def recommend_merge_partner(extreme: str, others: list[str]) -> str:
@@ -743,27 +811,48 @@ def stable_key(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:12]
 
 
-def render_merge_controls(preview: pd.DataFrame, raw_col: str, key_prefix: str) -> dict[str, str]:
+def render_merge_controls(preview: pd.DataFrame, raw_col: str, key_prefix: str) -> list[list[str]]:
     extreme = preview[(preview[raw_col].notna()) & ((preview[raw_col] < RAW_LOW) | (preview[raw_col] > RAW_HIGH))]
-    new_merges: dict[str, str] = dict(st.session_state.merge_map)
+    edge_set = merge_edges_list_to_set(st.session_state.merge_edges)
     if extreme.empty:
-        return new_merges
+        return merge_edges_set_to_list(edge_set)
     st.markdown("**Объединение страт** (только в этой сессии; исходный файл не меняется)")
+    st.caption(
+        "Для каждой ячейки с экстремальным весом выберите вторую страту или пункт «Не объединять». "
+        "После «Применить объединение» в таблице появится одна строка с названием вида «A + B» и пересчитанным весом."
+    )
     all_strata = [str(x) for x in preview["stratum"].values]
     for _, r in extreme.iterrows():
         a = str(r["stratum"])
-        options = ordered_merge_options(a, all_strata)
-        if not options:
+        base_opts = ordered_merge_options(a, all_strata)
+        if not base_opts:
             continue
-        rec = options[0]
+        rec = base_opts[0]
+        options = [NO_MERGE_STRATUM] + base_opts
+        partners = partner_atoms_for_display(a, edge_set)
+        default_choice = NO_MERGE_STRATUM
+        for atom in sorted(partners, key=natural_sort_key):
+            disp = display_for_atom(atom, all_strata)
+            if disp and disp != a:
+                default_choice = disp
+                break
         st.caption(f"Рекомендуется объединить «{a}» с «{rec}» (близкая по смыслу категория в отсортированном списке).")
+        idx0 = options.index(default_choice) if default_choice in options else 0
         choice = st.selectbox(
             f"Объединить «{a}» с…",
             options=options,
+            index=idx0,
             key=f"{key_prefix}_merge_{stable_key(a)}",
         )
-        new_merges[a] = choice
-    return new_merges
+        pa = set(atoms_from_display(a))
+        edge_set = {e for e in edge_set if not (e & pa)}
+        if choice != NO_MERGE_STRATUM:
+            pb = set(atoms_from_display(choice))
+            ra = sorted(pa, key=natural_sort_key)[0]
+            rb = sorted(pb, key=natural_sort_key)[0]
+            if ra != rb:
+                edge_set.add(frozenset({ra, rb}))
+    return merge_edges_set_to_list(edge_set)
 
 
 def build_excel_with_wt(survey_bytes: bytes, header_row: int, weights: np.ndarray) -> bytes:
@@ -886,7 +975,7 @@ def main() -> None:
         st.session_state.active_mode = mode
         st.session_state.weights = None
         st.session_state.preview_df = None
-        st.session_state.merge_map = {}
+        st.session_state.merge_edges = []
         st.session_state.mode1_recalc = None
         st.session_state.mode2_params = None
         st.session_state.preview_mode = None
@@ -939,7 +1028,7 @@ def main() -> None:
                         ros,
                         row_cols,
                         col_col,
-                        st.session_state.merge_map,
+                        st.session_state.merge_edges,
                         exclude_rows,
                         exclude_cols,
                     )
@@ -950,7 +1039,7 @@ def main() -> None:
                     if err:
                         st.error(err)
                     else:
-                        st.session_state.merge_map = {}
+                        st.session_state.merge_edges = []
                         st.session_state.weights = w
                         st.session_state.preview_df = prev
                         st.session_state.preview_baseline = prev.copy()
@@ -1003,7 +1092,7 @@ def main() -> None:
                         ros,
                         weight_vars,
                         survey_col_map,
-                        st.session_state.merge_map,
+                        st.session_state.merge_edges,
                         exclude_long,
                     )
                 except Exception:
@@ -1019,7 +1108,7 @@ def main() -> None:
                     if err:
                         st.error(err)
                     else:
-                        st.session_state.merge_map = {}
+                        st.session_state.merge_edges = []
                         st.session_state.weights = w
                         st.session_state.preview_df = prev
                         st.session_state.preview_baseline = prev.copy()
@@ -1036,7 +1125,7 @@ def main() -> None:
 
         prev1 = st.session_state.preview_df
         if prev1 is not None and st.session_state.get("preview_mode") == 1:
-            merge_on = bool(st.session_state.get("merge_map"))
+            merge_on = bool(st.session_state.get("merge_edges"))
             base = st.session_state.get("preview_baseline")
             if merge_on and base is not None and len(base) > 0:
                 with st.expander("Предпросмотр до объединения страт", expanded=False):
@@ -1059,9 +1148,9 @@ def main() -> None:
                 )
             st.dataframe(style_preview_mode1(prev1), use_container_width=True, hide_index=True)
 
-            new_merges = render_merge_controls(prev1, "raw_w", "m1")
+            new_edges = render_merge_controls(prev1, "raw_w", "m1")
             if st.button("Применить объединение", key="apply_merge1"):
-                st.session_state.merge_map = new_merges
+                st.session_state.merge_edges = new_edges
                 p = st.session_state.mode1_recalc
                 sur = st.session_state.survey_df
                 ros2 = st.session_state.rosstat_df
@@ -1072,7 +1161,7 @@ def main() -> None:
                             ros2,
                             p["row_cols"],
                             p["col_col"],
-                            new_merges,
+                            new_edges,
                             p.get("exclude_rows", []),
                             p.get("exclude_cols", []),
                         )
@@ -1082,7 +1171,7 @@ def main() -> None:
                             ros2,
                             p["weight_vars"],
                             p["survey_col_map"],
-                            new_merges,
+                            new_edges,
                             p.get("exclude_long", {}),
                         )
                     for i in infos:
@@ -1162,13 +1251,13 @@ def main() -> None:
                     target_cat,
                     weighted_cat,
                     soc_dem,
-                    st.session_state.merge_map,
+                    st.session_state.merge_edges,
                     na_is_category=True,
                 )
                 if err:
                     st.error(err)
                 else:
-                    st.session_state.merge_map = {}
+                    st.session_state.merge_edges = []
                     st.session_state.weights = w
                     st.session_state.preview_df = prev
                     st.session_state.preview_baseline = prev.copy()
@@ -1183,7 +1272,7 @@ def main() -> None:
 
         prev2 = st.session_state.preview_df
         if prev2 is not None and st.session_state.get("preview_mode") == 2:
-            merge_on = bool(st.session_state.get("merge_map"))
+            merge_on = bool(st.session_state.get("merge_edges"))
             base2 = st.session_state.get("preview_baseline")
             if merge_on and base2 is not None and len(base2) > 0:
                 with st.expander("Предпросмотр до объединения страт", expanded=False):
@@ -1200,9 +1289,9 @@ def main() -> None:
                 st.caption("Экстремальные веса (ниже 0,3 или выше 2,5) подсвечены красным.")
             st.dataframe(style_preview_mode2(prev2), use_container_width=True, hide_index=True)
 
-            new_merges = render_merge_controls(prev2, "raw_w", "m2")
+            new_edges = render_merge_controls(prev2, "raw_w", "m2")
             if st.button("Применить объединение", key="apply_merge2"):
-                st.session_state.merge_map = new_merges
+                st.session_state.merge_edges = new_edges
                 p = st.session_state.mode2_params
                 sur = st.session_state.survey_df
                 if p and sur is not None:
@@ -1212,7 +1301,7 @@ def main() -> None:
                         p["target_cat"],
                         p["weighted_cat"],
                         p["soc_dem"],
-                        new_merges,
+                        new_edges,
                         na_is_category=True,
                     )
                     if err:
