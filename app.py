@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import re
 import hashlib
@@ -54,6 +55,7 @@ def _init_session() -> None:
         "last_info": [],
         "last_warnings": [],
         "survey_leading_empty_rows": 0,
+        "mode1_dim_merge_groups": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -230,6 +232,50 @@ class _UnionFindStrata:
             self.parent[rb] = ra
 
 
+def merge_groups_to_edges(groups: list[list[str]] | None) -> list[list[str]]:
+    """Список групп категорий → рёбра для union-find (цепочка внутри группы)."""
+    edges: list[list[str]] = []
+    for g in groups or []:
+        g2 = [str(x).strip() for x in g if str(x).strip()]
+        if len(g2) < 2:
+            continue
+        for i in range(len(g2) - 1):
+            edges.append([g2[i], g2[i + 1]])
+    return edges
+
+
+def normalized_dimension_merge_map(universe_norm: set[str], merge_edges: list | None) -> dict[str, str]:
+    """Ключи уже в пространстве normalize_key; возвращает norm → укрупнённая метка (тоже в нижнем регистре и т.д.)."""
+    out: dict[str, str] = {k: k for k in universe_norm}
+    edge_set = merge_edges_list_to_set(merge_edges)
+    if not edge_set:
+        return out
+    nodes: set[str] = set(universe_norm)
+    for p in edge_set:
+        for x in p:
+            nodes.add(normalize_key(str(x)))
+    uf = _UnionFindStrata(nodes)
+    for p in edge_set:
+        a, b = tuple(p)
+        uf.union(normalize_key(str(a)), normalize_key(str(b)))
+    root_members: dict[str, list[str]] = {}
+    for n in nodes:
+        r = uf.find(n)
+        root_members.setdefault(r, []).append(n)
+    label_for: dict[str, str] = {}
+    for members in root_members.values():
+        if len(members) == 1:
+            m0 = members[0]
+            label_for[m0] = m0
+        else:
+            lbl = " + ".join(sorted(members, key=natural_sort_key))
+            for m in members:
+                label_for[m] = lbl
+    for k in universe_norm:
+        out[k] = label_for.get(k, k)
+    return out
+
+
 def apply_merge_edges(sk: pd.Series, merge_edges: list | None) -> pd.Series:
     """Объединяет страты по рёбрам; имя группы — «A + B + …» (порядок по natural_sort_key)."""
     edge_set = merge_edges_list_to_set(merge_edges)
@@ -398,11 +444,12 @@ def mode1_matrix_compute(
     merge_edges: list | None,
     exclude_rows: list[str],
     exclude_cols: list[str],
+    dim_merge_groups: dict[str, list[list[str]]] | None = None,
 ) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str, list[str], list[str]]:
     warns: list[str] = []
     infos: list[str] = []
     try:
-        joint, total_j, ex_msg = matrix_with_exclusions(rosstat, exclude_rows, exclude_cols)
+        joint, _total_old, ex_msg = matrix_with_exclusions(rosstat, exclude_rows, exclude_cols)
     except ValueError as e:
         return None, None, str(e), [], []
 
@@ -419,7 +466,23 @@ def mode1_matrix_compute(
     base_sk = build_stratum_key(d, survey_row_cols + [survey_col_col])
     d["_sk"] = apply_merge_edges(base_sk, merge_edges)
 
+    dmg = dim_merge_groups or {}
+    row_e = merge_groups_to_edges(dmg.get("matrix_row", []))
+    col_e = merge_groups_to_edges(dmg.get("matrix_col", []))
+    if row_e or col_e:
+        univ_kr = set(joint["_kr"].astype(str)) | set(d["_kr"].astype(str))
+        univ_kc = set(joint["_kc"].astype(str)) | set(d["_kc"].astype(str))
+        map_kr = normalized_dimension_merge_map(univ_kr, row_e)
+        map_kc = normalized_dimension_merge_map(univ_kc, col_e)
+        joint = joint.copy()
+        joint["_kr"] = joint["_kr"].astype(str).map(lambda x: map_kr.get(x, x))
+        joint["_kc"] = joint["_kc"].astype(str).map(lambda x: map_kc.get(x, x))
+        d["_kr"] = d["_kr"].astype(str).map(lambda x: map_kr.get(x, x))
+        d["_kc"] = d["_kc"].astype(str).map(lambda x: map_kc.get(x, x))
+        infos.append("Учтено укрупнение категорий Росстата по строкам и/или столбцам матрицы.")
+
     jt = joint.groupby(["_kr", "_kc"], dropna=False)["count"].sum()
+    total_j = float(jt.sum())
     pt_map = {k: float(v) / float(total_j) for k, v in jt.items()}
     pt_map = check_and_normalize_target_shares(pt_map, infos)
 
@@ -452,6 +515,7 @@ def mode1_table_compute(
     survey_col_map: dict[str, str],
     merge_edges: list | None,
     exclude_values: dict[str, list[str]],
+    dim_merge_groups: dict[str, list[list[str]]] | None = None,
 ) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str, list[str], list[str]]:
     warns: list[str] = []
     infos: list[str] = []
@@ -484,12 +548,6 @@ def mode1_table_compute(
     if rstat_f.empty:
         return None, None, "После исключения групп в файле Росстата не осталось строк.", [], []
 
-    joint = rstat_f.groupby(weight_vars, dropna=False)[tgt_col].sum().reset_index()
-    joint["count"] = joint[tgt_col].astype(float)
-    total_j = float(joint["count"].sum())
-    if total_j <= 0:
-        return None, None, "Сумма целевых значений в файле Росстата должна быть больше нуля.", [], []
-
     norm_cols: list[str] = []
     for v in weight_vars:
         sc = survey_col_map[v]
@@ -498,6 +556,27 @@ def mode1_table_compute(
         nc = f"_n_{v}"
         d[nc] = d[sc].map(normalize_key)
         norm_cols.append(nc)
+
+    dmg = dim_merge_groups or {}
+    dim_merged_any = False
+    for v in weight_vars:
+        edges = merge_groups_to_edges(dmg.get(v, []))
+        if not edges:
+            continue
+        nc = f"_n_{v}"
+        univ = set(rstat_f[v].astype(str).unique()) | set(d[nc].astype(str).unique())
+        mmap = normalized_dimension_merge_map(univ, edges)
+        rstat_f[v] = rstat_f[v].astype(str).map(lambda x: mmap.get(x, x))
+        d[nc] = d[nc].astype(str).map(lambda x: mmap.get(x, x))
+        dim_merged_any = True
+    if dim_merged_any:
+        infos.append("Учтено укрупнение категорий по переменным Росстата (таблица).")
+
+    joint = rstat_f.groupby(weight_vars, dropna=False)[tgt_col].sum().reset_index()
+    joint["count"] = joint[tgt_col].astype(float)
+    total_j = float(joint["count"].sum())
+    if total_j <= 0:
+        return None, None, "Сумма целевых значений в файле Росстата должна быть больше нуля.", [], []
 
     tuple_keys = []
     for _, row in joint.iterrows():
@@ -837,6 +916,137 @@ def stable_key(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:12]
 
 
+def render_mode1_dim_merge_matrix(ros: pd.DataFrame, exclude_rows: list[str], exclude_cols: list[str]) -> None:
+    """Укрупнение категорий по строкам/столбцам матрицы Росстата (режим 1)."""
+    mg = st.session_state.setdefault("mode1_dim_merge_groups", {})
+    mg.setdefault("matrix_col", [])
+    mg.setdefault("matrix_row", [])
+
+    st.subheader("Укрупнение категорий Росстата")
+    st.caption(
+        "Объединённые категории суммируются в **одну целевую ячейку** (как «Москва + Санкт-Петербург»). "
+        "Респонденты из любой из них получают один вес для этой части разреза. Исключённые из расчёта строки/столбцы здесь не показываются."
+    )
+
+    cols_geo = [
+        str(c)
+        for c in ros.columns[1:]
+        if str(c).strip() not in exclude_cols and str(c).strip().lower() != "общий итог"
+    ]
+    col_opts = sorted(cols_geo, key=natural_sort_key)
+
+    st.markdown("**Столбцы матрицы (география, тип НП и т.п.)**")
+    pick_c = st.multiselect(
+        "Выберите категории для одной группы",
+        options=col_opts,
+        key="m1_dim_col_pick",
+    )
+    if st.button("Добавить объединение по столбцам", key="m1_dim_col_add"):
+        if len(pick_c) >= 2:
+            mg["matrix_col"].append(list(pick_c))
+            st.rerun()
+        else:
+            st.warning("Отметьте не менее двух столбцов.")
+
+    for i, g in enumerate(list(mg["matrix_col"])):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.text(" + ".join(g))
+        with c2:
+            if st.button("Удалить", key=f"m1_dim_col_rm_{i}"):
+                mg["matrix_col"].pop(i)
+                st.rerun()
+
+    with st.expander("Укрупнение строк матрицы (при необходимости)", expanded=False):
+        r0 = ros.iloc[:, 0].dropna().astype(str).unique().tolist()
+        row_opts = sorted([x for x in r0 if x.strip() not in exclude_rows], key=natural_sort_key)
+        pick_r = st.multiselect(
+            "Строки в одну группу",
+            options=row_opts,
+            key="m1_dim_row_pick",
+        )
+        if st.button("Добавить объединение по строкам", key="m1_dim_row_add"):
+            if len(pick_r) >= 2:
+                mg["matrix_row"].append(list(pick_r))
+                st.rerun()
+            else:
+                st.warning("Отметьте не менее двух строк.")
+        for i, g in enumerate(list(mg["matrix_row"])):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.text(" + ".join(g))
+            with c2:
+                if st.button("Удалить", key=f"m1_dim_row_rm_{i}"):
+                    mg["matrix_row"].pop(i)
+                    st.rerun()
+
+    if st.button("Сбросить все укрупнения категорий", key="m1_dim_reset"):
+        mg["matrix_col"] = []
+        mg["matrix_row"] = []
+        st.rerun()
+
+
+def render_mode1_dim_merge_table(
+    ros: pd.DataFrame,
+    weight_vars: list[str],
+    survey_col_map: dict[str, str],
+    survey: pd.DataFrame,
+    exclude_values: dict[str, list[str]],
+) -> None:
+    """Укрупнение по одной из переменных длинной таблицы Росстата."""
+    if not weight_vars:
+        return
+    mg = st.session_state.setdefault("mode1_dim_merge_groups", {})
+    for v in weight_vars:
+        mg.setdefault(v, [])
+
+    st.subheader("Укрупнение категорий Росстата")
+    st.caption(
+        "Выберите измерение и несколько категорий, которые нужно слить в одну целевую группу "
+        "(численности в Росстате суммируются). Названия должны совпадать с опросом с учётом нормализации."
+    )
+
+    dim = st.selectbox(
+        "Измерение для укрупнения",
+        options=list(weight_vars),
+        key="m1_dim_table_dim",
+    )
+
+    excl = set(normalize_key(x) for x in (exclude_values.get(dim, []) or []))
+    rvals = ros[dim].dropna().astype(str).unique().tolist()
+    scol = survey_col_map.get(dim)
+    svals = survey[scol].dropna().astype(str).unique().tolist() if scol in survey.columns else []
+    opt_set = {str(x).strip() for x in rvals + svals if str(x).strip()}
+    options = sorted(opt_set, key=natural_sort_key)
+    options = [o for o in options if normalize_key(o) not in excl]
+
+    pick = st.multiselect(
+        f"Категории «{dim}» в одну группу",
+        options=options,
+        key="m1_dim_table_pick",
+    )
+    if st.button("Добавить объединение", key="m1_dim_table_add"):
+        if len(pick) >= 2:
+            mg[dim].append(list(pick))
+            st.rerun()
+        else:
+            st.warning("Отметьте не менее двух категорий.")
+
+    for i, g in enumerate(list(mg.get(dim, []))):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.text(" + ".join(g))
+        with c2:
+            if st.button("Удалить", key=f"m1_dim_tbl_rm_{stable_key(str(dim))}_{i}"):
+                mg[dim].pop(i)
+                st.rerun()
+
+    if st.button("Сбросить укрупнения по всем измерениям", key="m1_dim_table_reset_all"):
+        for v in weight_vars:
+            mg[v] = []
+        st.rerun()
+
+
 def render_merge_controls(preview: pd.DataFrame, raw_col: str, key_prefix: str) -> list[list[str]]:
     extreme = preview[(preview[raw_col].notna()) & ((preview[raw_col] < RAW_LOW) | (preview[raw_col] > RAW_HIGH))]
     edge_set = merge_edges_list_to_set(st.session_state.merge_edges)
@@ -1013,6 +1223,7 @@ def main() -> None:
         st.session_state.weights = None
         st.session_state.preview_df = None
         st.session_state.merge_edges = []
+        st.session_state.mode1_dim_merge_groups = {}
         st.session_state.mode1_recalc = None
         st.session_state.mode2_params = None
         st.session_state.preview_mode = None
@@ -1056,6 +1267,8 @@ def main() -> None:
                 options=list(survey.columns),
             )
 
+            render_mode1_dim_merge_matrix(ros, exclude_rows, exclude_cols)
+
             if st.button("Рассчитать веса (предпросмотр)", key="calc1m"):
                 if len(row_cols) < 1:
                     st.error("Выберите хотя бы одну колонку, соответствующую строкам матрицы Росстата.")
@@ -1068,6 +1281,7 @@ def main() -> None:
                         st.session_state.merge_edges,
                         exclude_rows,
                         exclude_cols,
+                        copy.deepcopy(st.session_state.get("mode1_dim_merge_groups", {})),
                     )
                     for i in infos:
                         st.info(i)
@@ -1087,6 +1301,9 @@ def main() -> None:
                             "col_col": col_col,
                             "exclude_rows": list(exclude_rows),
                             "exclude_cols": list(exclude_cols),
+                            "dim_merge_groups": copy.deepcopy(
+                                st.session_state.get("mode1_dim_merge_groups", {})
+                            ),
                         }
                         st.session_state.last_warnings = warns
                         st.session_state.last_info = infos
@@ -1122,6 +1339,8 @@ def main() -> None:
                     key=f"map_{v}",
                 )
 
+            render_mode1_dim_merge_table(ros, weight_vars, survey_col_map, survey, exclude_long)
+
             if st.button("Рассчитать веса (предпросмотр)", key="calc1t"):
                 try:
                     w, prev, err, warns, infos = mode1_table_compute(
@@ -1131,6 +1350,7 @@ def main() -> None:
                         survey_col_map,
                         st.session_state.merge_edges,
                         exclude_long,
+                        copy.deepcopy(st.session_state.get("mode1_dim_merge_groups", {})),
                     )
                 except Exception:
                     st.error(
@@ -1155,6 +1375,9 @@ def main() -> None:
                             "weight_vars": list(weight_vars),
                             "survey_col_map": dict(survey_col_map),
                             "exclude_long": {k: list(v) for k, v in exclude_long.items()},
+                            "dim_merge_groups": copy.deepcopy(
+                                st.session_state.get("mode1_dim_merge_groups", {})
+                            ),
                         }
                         st.session_state.last_warnings = warns
                         st.session_state.last_info = infos
@@ -1201,6 +1424,7 @@ def main() -> None:
                             new_edges,
                             p.get("exclude_rows", []),
                             p.get("exclude_cols", []),
+                            p.get("dim_merge_groups") or {},
                         )
                     else:
                         w, prev2, err, warns, infos = mode1_table_compute(
@@ -1210,6 +1434,7 @@ def main() -> None:
                             p["survey_col_map"],
                             new_edges,
                             p.get("exclude_long", {}),
+                            p.get("dim_merge_groups") or {},
                         )
                     for i in infos:
                         st.info(i)
