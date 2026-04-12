@@ -1,6 +1,7 @@
 """
-Веб-сервис подгонки выборки к внешним целям (Росстат, Streamlit).
-Постстратификация по ячейкам: вес = целевая доля / фактическая доля в ячейке (без дополнительной нормировки).
+Веб-сервис взвешивания опросов (Streamlit).
+Режим 1 — подгонка к Росстату: вес по ячейке = целевая доля / фактическая (без нормировки к среднему 1).
+Режим 2 — группа на группу: внутренняя калибровка, затем нормировка весов к среднему 1.
 """
 
 from __future__ import annotations
@@ -46,6 +47,9 @@ def _init_session() -> None:
         "preview_df": None,
         "merge_map": {},
         "mode1_recalc": None,
+        "mode2_params": None,
+        "preview_mode": None,
+        "active_mode": None,
         "last_info": [],
         "last_warnings": [],
     }
@@ -79,6 +83,15 @@ def normalize_key(x: Any) -> str:
         t = t.replace(a, b)
     t = " ".join(t.split())
     return t
+
+
+def normalize_weights_mean_one(w: np.ndarray) -> np.ndarray:
+    """Используется в режиме «группа на группу»."""
+    w = np.asarray(w, dtype=float)
+    m = float(np.mean(w))
+    if m <= 0 or not np.isfinite(m):
+        return np.ones_like(w)
+    return w / m
 
 
 def load_survey_excel(uploaded: Any, header_row: int) -> pd.DataFrame:
@@ -467,6 +480,100 @@ def mode1_table_compute(
     return w, preview, "", warns, infos
 
 
+def mode2_compute(
+    survey: pd.DataFrame,
+    split_var: str,
+    target_cat: str,
+    weighted_cat: str,
+    soc_dem: list[str],
+    merge_map: dict[str, str],
+    na_is_category: bool,
+) -> tuple[Optional[np.ndarray], Optional[pd.DataFrame], str]:
+    if not soc_dem:
+        return None, None, "Выберите хотя бы одну соц-дем переменную."
+    if split_var not in survey.columns:
+        return None, None, "В данных нет выбранной переменной-разделителя."
+
+    d = survey.copy()
+    for c in soc_dem:
+        if c not in d.columns:
+            return None, None, f"В данных нет колонки «{c}»."
+
+    def split_val(x: Any) -> str:
+        if pd.isna(x):
+            return "— Пропуск —" if na_is_category else ""
+        return str(x).strip()
+
+    d["_split_v"] = d[split_var].map(split_val)
+    tgt_l = "— Пропуск —" if target_cat == "— Пропуск —" else str(target_cat).strip()
+    wgt_l = "— Пропуск —" if weighted_cat == "— Пропуск —" else str(weighted_cat).strip()
+
+    is_t = d["_split_v"] == tgt_l
+    is_w = d["_split_v"] == wgt_l
+
+    sk = build_stratum_key(d, soc_dem)
+    sk = apply_merge_stratum(sk, merge_map)
+    n = len(d)
+    n_t = int(is_t.sum())
+    n_w = int(is_w.sum())
+    if n_t == 0 or n_w == 0:
+        return None, None, "В выборке нет респондентов целевой или взвешиваемой группы."
+
+    idx_by_s: dict[str, pd.Index] = {}
+    for s in sk.unique():
+        idx_by_s[str(s)] = sk[sk == s].index
+
+    raw_by_stratum: dict[str, float] = {}
+    for s, idx in idx_by_s.items():
+        nt = int(is_t.loc[idx].sum())
+        nw = int(is_w.loc[idx].sum())
+        if nt > 0 and nw == 0:
+            return (
+                None,
+                None,
+                "В выбранной страте нет респондентов во взвешиваемой группе. Объедините эту страту с соседней.",
+            )
+        if nt == 0:
+            raw_by_stratum[s] = 1.0
+            continue
+        pt = nt / n_t
+        pw = nw / n_w
+        raw_by_stratum[s] = (pt / pw) if pw > 0 else np.nan
+
+    w = np.ones(n, dtype=float)
+    for i in range(n):
+        s = str(sk.iloc[i])
+        if is_w.iloc[i]:
+            w[i] = raw_by_stratum.get(s, 1.0)
+
+    if np.any(~np.isfinite(w)):
+        return None, None, "Не удалось согласовать веса для всех страт. Попробуйте объединить страты."
+
+    w = normalize_weights_mean_one(w)
+
+    rows = []
+    strata = sorted(sk.unique(), key=str)
+    for s in strata:
+        idx = sk[sk == s].index
+        nt = int(is_t.loc[idx].sum())
+        nw = int(is_w.loc[idx].sum())
+        pt = nt / n_t if n_t else 0.0
+        pw = nw / n_w if n_w else 0.0
+        rw = raw_by_stratum.get(str(s), np.nan)
+        rows.append(
+            {
+                "stratum": s,
+                "n_target": nt,
+                "n_weighted": nw,
+                "share_target": pt,
+                "share_weighted": pw,
+                "raw_w": rw,
+            }
+        )
+    preview = pd.DataFrame(rows)
+    return w, preview, ""
+
+
 def natural_sort_key(s: str) -> tuple[Any, ...]:
     parts = re.split(r"(\d+)", str(s).lower())
     out: list[Any] = []
@@ -545,6 +652,41 @@ def style_preview_mode1(df: pd.DataFrame) -> Any:
     ).apply(_hl, subset=["Вес"])
 
 
+def style_preview_mode2(df: pd.DataFrame) -> Any:
+    disp = df.rename(
+        columns={
+            "stratum": "Ячейка",
+            "n_target": "Респондентов (целевая)",
+            "n_weighted": "Респондентов (взвешиваемая)",
+            "share_target": "Доля в целевой группе",
+            "share_weighted": "Доля во взвешиваемой группе",
+            "raw_w": "Вес",
+        }
+    )
+
+    def _hl(s: pd.Series) -> list[str]:
+        out = []
+        for v in s:
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                out.append("")
+                continue
+            if x < RAW_LOW or x > RAW_HIGH:
+                out.append(EXTREME_BG)
+            else:
+                out.append("")
+        return out
+
+    return disp.style.format(
+        {
+            "Доля в целевой группе": "{:.4f}",
+            "Доля во взвешиваемой группе": "{:.4f}",
+            "Вес": "{:.4f}",
+        }
+    ).apply(_hl, subset=["Вес"])
+
+
 def stable_key(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:12]
 
@@ -607,14 +749,14 @@ def export_fallback_dataframe(survey_df: pd.DataFrame, weights: np.ndarray) -> b
 
 def main() -> None:
     st.set_page_config(
-        page_title="Подгонка к Росстату",
+        page_title="Взвешивание опросов",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     _init_session()
 
     with st.sidebar:
-        st.title("Подгонка к Росстату")
+        st.title("Взвешивание опросов")
         data_file = st.file_uploader("Excel с данными опроса", type=["xlsx"], key="survey_up")
 
         hdr = st.number_input(
@@ -627,20 +769,26 @@ def main() -> None:
         )
         header_row = int(hdr) - 1
 
-        if st.session_state.rosstat_df is None:
-            rf = st.file_uploader("Файл Росстата (целевое распределение)", type=["xlsx"], key="ros_up")
-            if rf is not None:
-                try:
-                    st.session_state.rosstat_df = read_rosstat_excel(rf)
-                    st.session_state.rosstat_name = rf.name
-                except Exception:
-                    st.error("Не удалось прочитать файл Росстата. Проверьте формат.")
-        else:
-            st.success(f"Росстат загружен: **{st.session_state.rosstat_name}**")
-            if st.button("Сменить файл Росстата"):
-                st.session_state.rosstat_df = None
-                st.session_state.rosstat_name = None
-                st.rerun()
+        mode = st.radio(
+            "Режим",
+            ("Внешние цели (Росстат)", "Группа на группу"),
+        )
+
+        if mode == "Внешние цели (Росстат)":
+            if st.session_state.rosstat_df is None:
+                rf = st.file_uploader("Файл Росстата (целевое распределение)", type=["xlsx"], key="ros_up")
+                if rf is not None:
+                    try:
+                        st.session_state.rosstat_df = read_rosstat_excel(rf)
+                        st.session_state.rosstat_name = rf.name
+                    except Exception:
+                        st.error("Не удалось прочитать файл Росстата. Проверьте формат.")
+            else:
+                st.success(f"Росстат загружен: **{st.session_state.rosstat_name}**")
+                if st.button("Сменить файл Росстата"):
+                    st.session_state.rosstat_df = None
+                    st.session_state.rosstat_name = None
+                    st.rerun()
 
         if st.button("Сбросить всё"):
             reset_session()
@@ -649,12 +797,12 @@ def main() -> None:
         with st.expander("Справка: как читать веса"):
             st.markdown(
                 """
-**Подгонка (постстратификация):** в каждой ячейке вес = целевая доля ÷ фактическая доля в выборке.
-Взвешенное распределение по выбранным ячейкам **совпадает** с целевым (после ваших исключений в файле Росстата).
+**Режим Росстат** — постстратификация: в ячейке вес = целевая доля ÷ фактическая доля в выборке.
+Взвешенное распределение по ячейкам совпадает с целевым (с учётом исключений). Сумма весов обычно равна **N**,
+если все респонденты в ячейках с целью и сумма целевых долей по ним равна 1. Нормировка «средний вес = 1» **не применяется**.
 
-**Сумма весов** по выборке равна числу респондентов **N**, если все они попали в ячейки с ненулевой целью и
-доли целей по этим ячейкам в сумме дают 1. Отдельная нормировка «средний вес = 1» **не делается** —
-она не нужна для подгонки и только масштабировала бы все веса одинаково.
+**Режим группа на группу** — эталон — одна подгруппа опроса; взвешивается другая так, чтобы по выбранным соц-дем
+переменным её структура совпала с эталоном. У целевой группы вес 1, затем все веса **нормируются к среднему 1**.
 """
             )
 
@@ -682,213 +830,325 @@ def main() -> None:
     st.session_state.survey_df = survey
     survey = st.session_state.survey_df
 
-    st.header("Подгонка выборки к целям Росстата")
-    ros = st.session_state.get("rosstat_df")
-    if ros is None:
-        st.warning("Загрузите файл Росстата в боковой панели.")
-        return
+    if st.session_state.get("active_mode") != mode:
+        st.session_state.active_mode = mode
+        st.session_state.weights = None
+        st.session_state.preview_df = None
+        st.session_state.merge_map = {}
+        st.session_state.mode1_recalc = None
+        st.session_state.mode2_params = None
+        st.session_state.preview_mode = None
 
-    is_matrix = detect_rosstat_matrix(ros)
-    st.caption(
-        "Формат **матрицы**: в строках — пол и возраст (или склеенная подпись), в столбцах — география; в ячейках — численность."
-        if is_matrix
-        else "Формат **таблицы**: столбцы — измерения и показатель (численность или доля)."
-    )
+    if mode == "Внешние цели (Росстат)":
+        st.header("Режим 1: подгонка к целям Росстата")
+        ros = st.session_state.get("rosstat_df")
+        if ros is None:
+            st.warning("Загрузите файл Росстата в боковой панели.")
+            return
 
-    exclude_rows: list[str] = []
-    exclude_cols: list[str] = []
-    exclude_long: dict[str, list[str]] = {}
-
-    if is_matrix:
-        r0 = ros.iloc[:, 0].dropna().astype(str).unique().tolist()
-        cols = [str(c) for c in ros.columns[1:]]
-        st.subheader("Группы Росстата, не участвующие в расчёте")
-        st.caption("Отметьте строки и столбцы матрицы, которые нужно исключить из целевых долей.")
-        exclude_rows = st.multiselect("Исключить строки матрицы", options=sorted(r0, key=natural_sort_key), default=[])
-        exclude_cols = st.multiselect("Исключить столбцы (география и т.п.)", options=sorted(cols, key=natural_sort_key), default=[])
-
-        st.subheader("Сопоставление с опросом")
-        st.caption("Названия колонок опроса берутся из выбранной строки заголовков (см. боковую панель).")
-        row_cols = st.multiselect(
-            "Колонки опроса для **строк** матрицы (пол, возраст — можно несколько, значения склеиваются)",
-            options=list(survey.columns),
-            default=[survey.columns[0]] if len(survey.columns) else [],
-        )
-        col_col = st.selectbox(
-            "Колонка опроса для **столбцов** матрицы (география)",
-            options=list(survey.columns),
+        is_matrix = detect_rosstat_matrix(ros)
+        st.caption(
+            "Формат **матрицы**: в строках — пол и возраст (или склеенная подпись), в столбцах — география; в ячейках — численность."
+            if is_matrix
+            else "Формат **таблицы**: столбцы — измерения и показатель (численность или доля)."
         )
 
-        if st.button("Рассчитать веса (предпросмотр)", key="calc1m"):
-            if len(row_cols) < 1:
-                st.error("Выберите хотя бы одну колонку, соответствующую строкам матрицы Росстата.")
-            else:
-                w, prev, err, warns, infos = mode1_matrix_compute(
-                    survey,
-                    ros,
-                    row_cols,
-                    col_col,
-                    st.session_state.merge_map,
-                    exclude_rows,
-                    exclude_cols,
-                )
-                for i in infos:
-                    st.info(i)
-                for wn in warns:
-                    st.warning(wn)
-                if err:
-                    st.error(err)
+        exclude_rows: list[str] = []
+        exclude_cols: list[str] = []
+        exclude_long: dict[str, list[str]] = {}
+
+        if is_matrix:
+            r0 = ros.iloc[:, 0].dropna().astype(str).unique().tolist()
+            cols = [str(c) for c in ros.columns[1:]]
+            st.subheader("Группы Росстата, не участвующие в расчёте")
+            st.caption("Отметьте строки и столбцы матрицы, которые нужно исключить из целевых долей.")
+            exclude_rows = st.multiselect("Исключить строки матрицы", options=sorted(r0, key=natural_sort_key), default=[])
+            exclude_cols = st.multiselect("Исключить столбцы (география и т.п.)", options=sorted(cols, key=natural_sort_key), default=[])
+
+            st.subheader("Сопоставление с опросом")
+            st.caption("Названия колонок опроса берутся из выбранной строки заголовков (см. боковую панель).")
+            row_cols = st.multiselect(
+                "Колонки опроса для **строк** матрицы (пол, возраст — можно несколько, значения склеиваются)",
+                options=list(survey.columns),
+                default=[survey.columns[0]] if len(survey.columns) else [],
+            )
+            col_col = st.selectbox(
+                "Колонка опроса для **столбцов** матрицы (география)",
+                options=list(survey.columns),
+            )
+
+            if st.button("Рассчитать веса (предпросмотр)", key="calc1m"):
+                if len(row_cols) < 1:
+                    st.error("Выберите хотя бы одну колонку, соответствующую строкам матрицы Росстата.")
                 else:
-                    st.session_state.merge_map = {}
-                    st.session_state.weights = w
-                    st.session_state.preview_df = prev
-                    st.session_state.mode1_recalc = {
-                        "kind": "matrix",
-                        "row_cols": list(row_cols),
-                        "col_col": col_col,
-                        "exclude_rows": list(exclude_rows),
-                        "exclude_cols": list(exclude_cols),
-                    }
-                    st.session_state.last_warnings = warns
-                    st.session_state.last_info = infos
-                    st.rerun()
+                    w, prev, err, warns, infos = mode1_matrix_compute(
+                        survey,
+                        ros,
+                        row_cols,
+                        col_col,
+                        st.session_state.merge_map,
+                        exclude_rows,
+                        exclude_cols,
+                    )
+                    for i in infos:
+                        st.info(i)
+                    for wn in warns:
+                        st.warning(wn)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.merge_map = {}
+                        st.session_state.weights = w
+                        st.session_state.preview_df = prev
+                        st.session_state.preview_mode = 1
+                        st.session_state.mode1_recalc = {
+                            "kind": "matrix",
+                            "row_cols": list(row_cols),
+                            "col_col": col_col,
+                            "exclude_rows": list(exclude_rows),
+                            "exclude_cols": list(exclude_cols),
+                        }
+                        st.session_state.last_warnings = warns
+                        st.session_state.last_info = infos
+                        st.rerun()
+
+        else:
+            cand = [c for c in ros.columns if str(c).lower() not in TARGET_COL_CANDIDATES]
+            tgt_col = _pick_target_col(ros)
+            if tgt_col and tgt_col in cand:
+                cand = [c for c in cand if c != tgt_col]
+
+            st.subheader("Группы Росстата, не участвующие в расчёте")
+            for v in cand:
+                vals = ros[v].dropna().astype(str).unique().tolist()
+                if vals:
+                    exclude_long[v] = st.multiselect(
+                        f"Исключить значения в «{v}»",
+                        options=sorted(vals, key=natural_sort_key),
+                        key=f"ex_{v}",
+                    )
+
+            weight_vars = st.multiselect(
+                "Переменные взвешивания (как в файле Росстата)",
+                options=cand,
+                default=cand[: min(3, len(cand))] if cand else [],
+            )
+            st.caption("Для каждой переменной укажите соответствующую колонку в файле опроса.")
+            survey_col_map: dict[str, str] = {}
+            for v in weight_vars:
+                survey_col_map[v] = st.selectbox(
+                    f"Колонка в опросе для «{v}»",
+                    options=list(survey.columns),
+                    key=f"map_{v}",
+                )
+
+            if st.button("Рассчитать веса (предпросмотр)", key="calc1t"):
+                try:
+                    w, prev, err, warns, infos = mode1_table_compute(
+                        survey,
+                        ros,
+                        weight_vars,
+                        survey_col_map,
+                        st.session_state.merge_map,
+                        exclude_long,
+                    )
+                except Exception:
+                    st.error(
+                        "Не удалось выполнить расчёт. Проверьте, что в файле Росстата есть численности или доли "
+                        "и что категории в опросе совпадают по смыслу с категориями в файле Росстата."
+                    )
+                else:
+                    for i in infos:
+                        st.info(i)
+                    for wn in warns:
+                        st.warning(wn)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.merge_map = {}
+                        st.session_state.weights = w
+                        st.session_state.preview_df = prev
+                        st.session_state.preview_mode = 1
+                        st.session_state.mode1_recalc = {
+                            "kind": "table",
+                            "weight_vars": list(weight_vars),
+                            "survey_col_map": dict(survey_col_map),
+                            "exclude_long": {k: list(v) for k, v in exclude_long.items()},
+                        }
+                        st.session_state.last_warnings = warns
+                        st.session_state.last_info = infos
+                        st.rerun()
+
+        prev1 = st.session_state.preview_df
+        if prev1 is not None and st.session_state.get("preview_mode") == 1:
+            st.subheader("Предпросмотр по ячейкам")
+            if st.session_state.weights is not None:
+                ww = np.asarray(st.session_state.weights, dtype=float)
+                st.caption(
+                    f"Контроль подгонки: сумма весов = **{np.nansum(ww):.2f}**, число респондентов **{len(ww)}**. "
+                    "При полном покрытии ячеек и сумме целевых долей 1 они совпадают."
+                )
+            st.dataframe(style_preview_mode1(prev1), use_container_width=True, hide_index=True)
+
+            new_merges = render_merge_controls(prev1, "raw_w", "m1")
+            if st.button("Применить объединение", key="apply_merge1"):
+                st.session_state.merge_map = new_merges
+                p = st.session_state.mode1_recalc
+                sur = st.session_state.survey_df
+                ros2 = st.session_state.rosstat_df
+                if p and sur is not None and ros2 is not None:
+                    if p["kind"] == "matrix":
+                        w, prev2, err, warns, infos = mode1_matrix_compute(
+                            sur,
+                            ros2,
+                            p["row_cols"],
+                            p["col_col"],
+                            new_merges,
+                            p.get("exclude_rows", []),
+                            p.get("exclude_cols", []),
+                        )
+                    else:
+                        w, prev2, err, warns, infos = mode1_table_compute(
+                            sur,
+                            ros2,
+                            p["weight_vars"],
+                            p["survey_col_map"],
+                            new_merges,
+                            p.get("exclude_long", {}),
+                        )
+                    for i in infos:
+                        st.info(i)
+                    for wn in warns:
+                        st.warning(wn)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.weights = w
+                        st.session_state.preview_df = prev2
+                st.rerun()
+
+            if st.session_state.weights is not None:
+                wb = st.session_state.weights
+                try:
+                    xbytes = build_excel_with_wt(st.session_state.survey_bytes, header_row, wb)
+                    fname = (st.session_state.survey_name or "опрос").rsplit(".", 1)[0] + "_с_WT.xlsx"
+                    st.download_button(
+                        label="Применить веса и скачать Excel",
+                        data=xbytes,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl1",
+                    )
+                except Exception:
+                    st.caption("Не удалось сохранить исходный макет листа; выгружается таблица с заголовками из строки переменных.")
+                    xbytes = export_fallback_dataframe(survey, wb)
+                    st.download_button(
+                        label="Применить веса и скачать Excel",
+                        data=xbytes,
+                        file_name="опрос_с_весами_WT.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl1b",
+                    )
 
     else:
-        cand = [c for c in ros.columns if str(c).lower() not in TARGET_COL_CANDIDATES]
-        tgt_col = _pick_target_col(ros)
-        if tgt_col and tgt_col in cand:
-            cand = [c for c in cand if c != tgt_col]
-
-        st.subheader("Группы Росстата, не участвующие в расчёте")
-        for v in cand:
-            vals = ros[v].dropna().astype(str).unique().tolist()
-            if vals:
-                exclude_long[v] = st.multiselect(
-                    f"Исключить значения в «{v}»",
-                    options=sorted(vals, key=natural_sort_key),
-                    key=f"ex_{v}",
-                )
-
-        weight_vars = st.multiselect(
-            "Переменные взвешивания (как в файле Росстата)",
-            options=cand,
-            default=cand[: min(3, len(cand))] if cand else [],
-        )
-        st.caption("Для каждой переменной укажите соответствующую колонку в файле опроса.")
-        survey_col_map: dict[str, str] = {}
-        for v in weight_vars:
-            survey_col_map[v] = st.selectbox(
-                f"Колонка в опросе для «{v}»",
-                options=list(survey.columns),
-                key=f"map_{v}",
-            )
-
-        if st.button("Рассчитать веса (предпросмотр)", key="calc1t"):
-            try:
-                w, prev, err, warns, infos = mode1_table_compute(
-                    survey,
-                    ros,
-                    weight_vars,
-                    survey_col_map,
-                    st.session_state.merge_map,
-                    exclude_long,
-                )
-            except Exception:
-                st.error(
-                    "Не удалось выполнить расчёт. Проверьте, что в файле Росстата есть численности или доли "
-                    "и что категории в опросе совпадают по смыслу с категориями в файле Росстата."
-                )
+        st.header("Режим 2: группа на группу")
+        split_var = st.selectbox("Переменная-разделитель", options=list(survey.columns))
+        vals = survey[split_var].unique()
+        cat_list: list[str] = []
+        has_na = bool(survey[split_var].isna().any())
+        for v in vals:
+            if pd.isna(v):
+                cat_list.append("— Пропуск —")
             else:
-                for i in infos:
-                    st.info(i)
-                for wn in warns:
-                    st.warning(wn)
+                cat_list.append(str(v).strip())
+        if has_na and "— Пропуск —" not in cat_list:
+            cat_list.append("— Пропуск —")
+        cat_list = sorted(set(cat_list), key=lambda x: (x != "— Пропуск —", natural_sort_key(x)))
+
+        target_cat = st.selectbox("Целевая группа (эталон)", options=cat_list)
+        weighted_cat = st.selectbox("Взвешиваемая группа", options=cat_list)
+        soc_dem = st.multiselect(
+            "Соц-дем переменные (страты)",
+            options=[c for c in survey.columns if c != split_var],
+        )
+
+        if st.button("Рассчитать веса (предпросмотр)", key="calc2"):
+            if target_cat == weighted_cat:
+                st.error("Целевая и взвешиваемая группы должны различаться.")
+            else:
+                w, prev, err = mode2_compute(
+                    survey,
+                    split_var,
+                    target_cat,
+                    weighted_cat,
+                    soc_dem,
+                    st.session_state.merge_map,
+                    na_is_category=True,
+                )
                 if err:
                     st.error(err)
                 else:
                     st.session_state.merge_map = {}
                     st.session_state.weights = w
                     st.session_state.preview_df = prev
-                    st.session_state.mode1_recalc = {
-                        "kind": "table",
-                        "weight_vars": list(weight_vars),
-                        "survey_col_map": dict(survey_col_map),
-                        "exclude_long": {k: list(v) for k, v in exclude_long.items()},
+                    st.session_state.preview_mode = 2
+                    st.session_state.mode2_params = {
+                        "split_var": split_var,
+                        "target_cat": target_cat,
+                        "weighted_cat": weighted_cat,
+                        "soc_dem": list(soc_dem),
                     }
-                    st.session_state.last_warnings = warns
-                    st.session_state.last_info = infos
                     st.rerun()
 
-    prev = st.session_state.preview_df
-    if prev is not None:
-        st.subheader("Предпросмотр по ячейкам")
-        if st.session_state.weights is not None:
-            ww = np.asarray(st.session_state.weights, dtype=float)
-            st.caption(
-                f"Контроль подгонки: сумма весов = **{np.nansum(ww):.2f}**, число респондентов **{len(ww)}**. "
-                "При полном покрытии ячеек и сумме целевых долей 1 они совпадают."
-            )
-        st.dataframe(style_preview_mode1(prev), use_container_width=True, hide_index=True)
+        prev2 = st.session_state.preview_df
+        if prev2 is not None and st.session_state.get("preview_mode") == 2:
+            st.subheader("Предпросмотр по ячейкам")
+            st.dataframe(style_preview_mode2(prev2), use_container_width=True, hide_index=True)
 
-        new_merges = render_merge_controls(prev, "raw_w", "m1")
-        if st.button("Применить объединение", key="apply_merge1"):
-            st.session_state.merge_map = new_merges
-            p = st.session_state.mode1_recalc
-            sur = st.session_state.survey_df
-            ros2 = st.session_state.rosstat_df
-            if p and sur is not None and ros2 is not None:
-                if p["kind"] == "matrix":
-                    w, prev2, err, warns, infos = mode1_matrix_compute(
+            new_merges = render_merge_controls(prev2, "raw_w", "m2")
+            if st.button("Применить объединение", key="apply_merge2"):
+                st.session_state.merge_map = new_merges
+                p = st.session_state.mode2_params
+                sur = st.session_state.survey_df
+                if p and sur is not None:
+                    w, prev2b, err = mode2_compute(
                         sur,
-                        ros2,
-                        p["row_cols"],
-                        p["col_col"],
+                        p["split_var"],
+                        p["target_cat"],
+                        p["weighted_cat"],
+                        p["soc_dem"],
                         new_merges,
-                        p.get("exclude_rows", []),
-                        p.get("exclude_cols", []),
+                        na_is_category=True,
                     )
-                else:
-                    w, prev2, err, warns, infos = mode1_table_compute(
-                        sur,
-                        ros2,
-                        p["weight_vars"],
-                        p["survey_col_map"],
-                        new_merges,
-                        p.get("exclude_long", {}),
-                    )
-                for i in infos:
-                    st.info(i)
-                for wn in warns:
-                    st.warning(wn)
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.weights = w
-                    st.session_state.preview_df = prev2
-            st.rerun()
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.weights = w
+                        st.session_state.preview_df = prev2b
+                st.rerun()
 
-        if st.session_state.weights is not None:
-            wb = st.session_state.weights
-            try:
-                xbytes = build_excel_with_wt(st.session_state.survey_bytes, header_row, wb)
-                fname = (st.session_state.survey_name or "опрос").rsplit(".", 1)[0] + "_с_WT.xlsx"
-                st.download_button(
-                    label="Применить веса и скачать Excel",
-                    data=xbytes,
-                    file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl1",
-                )
-            except Exception:
-                st.caption("Не удалось сохранить исходный макет листа; выгружается таблица с заголовками из строки переменных.")
-                xbytes = export_fallback_dataframe(survey, wb)
-                st.download_button(
-                    label="Применить веса и скачать Excel",
-                    data=xbytes,
-                    file_name="опрос_с_весами_WT.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl1b",
-                )
+            if st.session_state.weights is not None:
+                wb = st.session_state.weights
+                try:
+                    xbytes = build_excel_with_wt(st.session_state.survey_bytes, header_row, wb)
+                    fname = (st.session_state.survey_name or "опрос").rsplit(".", 1)[0] + "_с_WT.xlsx"
+                    st.download_button(
+                        label="Применить веса и скачать Excel",
+                        data=xbytes,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl2",
+                    )
+                except Exception:
+                    st.caption("Не удалось сохранить исходный макет листа; выгружается таблица с заголовками из строки переменных.")
+                    xbytes = export_fallback_dataframe(survey, wb)
+                    st.download_button(
+                        label="Применить веса и скачать Excel",
+                        data=xbytes,
+                        file_name="опрос_с_весами_WT.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl2b",
+                    )
 
 
 if __name__ == "__main__":
