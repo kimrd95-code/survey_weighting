@@ -53,6 +53,7 @@ def _init_session() -> None:
         "preview_baseline": None,
         "last_info": [],
         "last_warnings": [],
+        "survey_leading_empty_rows": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -99,6 +100,30 @@ def is_no_text_cell(x: Any) -> bool:
     return s == ""
 
 
+def row_is_fully_empty(row: pd.Series) -> bool:
+    """True, если во всех колонках строки нет данных (как полностью пустая строка в Excel)."""
+    return bool(all(is_no_text_cell(v) for v in row))
+
+
+def count_leading_fully_empty_rows(df: pd.DataFrame) -> int:
+    """Сколько полностью пустых строк подряд с начала таблицы (до первой непустой)."""
+    n = 0
+    for i in range(len(df)):
+        if row_is_fully_empty(df.iloc[i]):
+            n += 1
+        else:
+            break
+    return n
+
+
+def drop_fully_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Удаляет строки, где все ячейки пустые — их не считаем респондентами."""
+    if df.empty:
+        return df
+    keep = ~df.apply(row_is_fully_empty, axis=1)
+    return df.loc[keep].reset_index(drop=True)
+
+
 def survey_cell_stratum_label(x: Any) -> str:
     """Метка для склейки страт: без текста → __ПРОПУСК__, иначе текст без лишних пробелов по краям."""
     if is_no_text_cell(x):
@@ -122,7 +147,11 @@ def stratum_is_proskip_only(s: str) -> bool:
 
 def load_survey_excel(uploaded: Any, header_row: int) -> pd.DataFrame:
     uploaded.seek(0)
-    return pd.read_excel(uploaded, sheet_name=0, header=int(header_row))
+    df = pd.read_excel(uploaded, sheet_name=0, header=int(header_row))
+    leading = count_leading_fully_empty_rows(df)
+    df = drop_fully_empty_rows(df)
+    df.attrs["leading_fully_empty_rows"] = leading
+    return df
 
 
 def read_rosstat_excel(uploaded: Any) -> pd.DataFrame:
@@ -852,8 +881,17 @@ def render_merge_controls(preview: pd.DataFrame, raw_col: str, key_prefix: str) 
     return merge_edges_set_to_list(edge_set)
 
 
-def build_excel_with_wt(survey_bytes: bytes, header_row: int, weights: np.ndarray) -> bytes:
-    """Добавляет столбец WT в конец листа, не изменяя существующие ячейки (включая строки над заголовком)."""
+def build_excel_with_wt(
+    survey_bytes: bytes,
+    header_row: int,
+    weights: np.ndarray,
+    leading_empty_rows: int = 0,
+) -> bytes:
+    """Добавляет столбец WT в конец листа, не изменяя существующие ячейки (включая строки над заголовком).
+
+    leading_empty_rows — сколько полностью пустых строк шло сразу под заголовком в исходном файле;
+    их мы не загружаем в DataFrame, поэтому первый вес сдвигается на столько строк вниз.
+    """
     bio = io.BytesIO(survey_bytes)
     wb = load_workbook(bio)
     ws = wb.active
@@ -867,7 +905,8 @@ def build_excel_with_wt(survey_bytes: bytes, header_row: int, weights: np.ndarra
     ws.cell(row=hdr, column=wt_col, value="WT")
 
     w = np.asarray(weights, dtype=float).ravel()
-    data_start = hdr + 1
+    skip = max(0, int(leading_empty_rows))
+    data_start = hdr + 1 + skip
     for i in range(len(w)):
         ws.cell(row=data_start + i, column=wt_col, value=float(w[i]))
 
@@ -966,6 +1005,7 @@ def main() -> None:
         return
 
     st.session_state.survey_df = survey
+    st.session_state.survey_leading_empty_rows = int(survey.attrs.get("leading_fully_empty_rows", 0))
     survey = st.session_state.survey_df
 
     if st.session_state.get("active_mode") != mode:
@@ -1185,7 +1225,12 @@ def main() -> None:
             if st.session_state.weights is not None:
                 wb = st.session_state.weights
                 try:
-                    xbytes = build_excel_with_wt(st.session_state.survey_bytes, header_row, wb)
+                    xbytes = build_excel_with_wt(
+                        st.session_state.survey_bytes,
+                        header_row,
+                        wb,
+                        st.session_state.get("survey_leading_empty_rows", 0),
+                    )
                     fname = (st.session_state.survey_name or "опрос").rsplit(".", 1)[0] + "_с_WT.xlsx"
                     st.download_button(
                         label="Применить веса и скачать Excel",
@@ -1305,7 +1350,12 @@ def main() -> None:
             if st.session_state.weights is not None:
                 wb = st.session_state.weights
                 try:
-                    xbytes = build_excel_with_wt(st.session_state.survey_bytes, header_row, wb)
+                    xbytes = build_excel_with_wt(
+                        st.session_state.survey_bytes,
+                        header_row,
+                        wb,
+                        st.session_state.get("survey_leading_empty_rows", 0),
+                    )
                     fname = (st.session_state.survey_name or "опрос").rsplit(".", 1)[0] + "_с_WT.xlsx"
                     st.download_button(
                         label="Применить веса и скачать Excel",
