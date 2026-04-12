@@ -50,6 +50,7 @@ def _init_session() -> None:
         "mode2_params": None,
         "preview_mode": None,
         "active_mode": None,
+        "preview_baseline": None,
         "last_info": [],
         "last_warnings": [],
     }
@@ -861,6 +862,7 @@ def main() -> None:
         st.session_state.mode1_recalc = None
         st.session_state.mode2_params = None
         st.session_state.preview_mode = None
+        st.session_state.preview_baseline = None
 
     if mode == "Внешние цели (Росстат)":
         st.header("Режим 1: подгонка к целям Росстата")
@@ -923,6 +925,7 @@ def main() -> None:
                         st.session_state.merge_map = {}
                         st.session_state.weights = w
                         st.session_state.preview_df = prev
+                        st.session_state.preview_baseline = prev.copy()
                         st.session_state.preview_mode = 1
                         st.session_state.mode1_recalc = {
                             "kind": "matrix",
@@ -991,6 +994,7 @@ def main() -> None:
                         st.session_state.merge_map = {}
                         st.session_state.weights = w
                         st.session_state.preview_df = prev
+                        st.session_state.preview_baseline = prev.copy()
                         st.session_state.preview_mode = 1
                         st.session_state.mode1_recalc = {
                             "kind": "table",
@@ -1004,7 +1008,21 @@ def main() -> None:
 
         prev1 = st.session_state.preview_df
         if prev1 is not None and st.session_state.get("preview_mode") == 1:
-            st.subheader("Предпросмотр по ячейкам")
+            merge_on = bool(st.session_state.get("merge_map"))
+            base = st.session_state.get("preview_baseline")
+            if merge_on and base is not None and len(base) > 0:
+                with st.expander("Предпросмотр до объединения страт", expanded=False):
+                    st.caption("Исходные ячейки; экстремальные веса (ниже 0,3 или выше 2,5) подсвечены.")
+                    st.dataframe(style_preview_mode1(base), use_container_width=True, hide_index=True)
+            st.subheader(
+                "Предпросмотр после объединения страт" if merge_on else "Предпросмотр по ячейкам"
+            )
+            if merge_on:
+                st.caption(
+                    "Таблица **пересчитана** по укрупнённым ячейкам; веса и доли соответствуют выбранному объединению страт."
+                )
+            else:
+                st.caption("Экстремальные веса (ниже 0,3 или выше 2,5) подсвечены красным. При необходимости объедините страты ниже.")
             if st.session_state.weights is not None:
                 ww = np.asarray(st.session_state.weights, dtype=float)
                 st.caption(
@@ -1125,6 +1143,7 @@ def main() -> None:
                     st.session_state.merge_map = {}
                     st.session_state.weights = w
                     st.session_state.preview_df = prev
+                    st.session_state.preview_baseline = prev.copy()
                     st.session_state.preview_mode = 2
                     st.session_state.mode2_params = {
                         "split_var": split_var,
@@ -1136,7 +1155,21 @@ def main() -> None:
 
         prev2 = st.session_state.preview_df
         if prev2 is not None and st.session_state.get("preview_mode") == 2:
-            st.subheader("Предпросмотр по ячейкам")
+            merge_on = bool(st.session_state.get("merge_map"))
+            base2 = st.session_state.get("preview_baseline")
+            if merge_on and base2 is not None and len(base2) > 0:
+                with st.expander("Предпросмотр до объединения страт", expanded=False):
+                    st.caption("Исходные ячейки; экстремальные веса подсвечены.")
+                    st.dataframe(style_preview_mode2(base2), use_container_width=True, hide_index=True)
+            st.subheader(
+                "Предпросмотр после объединения страт" if merge_on else "Предпросмотр по ячейкам"
+            )
+            if merge_on:
+                st.caption(
+                    "Таблица **пересчитана** по укрупнённым ячейкам после объединения; веса обновлены."
+                )
+            else:
+                st.caption("Экстремальные веса (ниже 0,3 или выше 2,5) подсвечены красным.")
             st.dataframe(style_preview_mode2(prev2), use_container_width=True, hide_index=True)
 
             new_merges = render_merge_controls(prev2, "raw_w", "m2")
