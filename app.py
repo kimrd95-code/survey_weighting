@@ -85,6 +85,28 @@ def normalize_key(x: Any) -> str:
     return t
 
 
+def is_no_text_cell(x: Any) -> bool:
+    """True, если в ячейке нет ответа: пропуск, пустая строка или только пробелы."""
+    if pd.isna(x):
+        return True
+    if isinstance(x, str):
+        return x.strip() == ""
+    try:
+        s = str(x).strip()
+    except Exception:
+        return True
+    return s == ""
+
+
+def survey_cell_stratum_label(x: Any) -> str:
+    """Метка для склейки страт: без текста → __ПРОПУСК__, иначе текст без лишних пробелов по краям."""
+    if is_no_text_cell(x):
+        return "__ПРОПУСК__"
+    if isinstance(x, str):
+        return x.strip()
+    return str(x).strip()
+
+
 def normalize_weights_mean_one(w: np.ndarray) -> np.ndarray:
     """Используется в режиме «группа на группу»."""
     w = np.asarray(w, dtype=float)
@@ -169,7 +191,7 @@ def apply_merge_stratum(sk: pd.Series, merge_map: dict[str, str]) -> pd.Series:
 def build_stratum_key(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     parts = []
     for c in cols:
-        parts.append(df[c].astype(str).fillna("__ПРОПУСК__"))
+        parts.append(df[c].map(survey_cell_stratum_label))
     if len(parts) == 1:
         return parts[0]
     return parts[0].str.cat(parts[1:], sep=", ")
@@ -500,8 +522,10 @@ def mode2_compute(
             return None, None, f"В данных нет колонки «{c}»."
 
     def split_val(x: Any) -> str:
-        if pd.isna(x):
+        if is_no_text_cell(x):
             return "— Пропуск —" if na_is_category else ""
+        if isinstance(x, str):
+            return x.strip()
         return str(x).strip()
 
     d["_split_v"] = d[split_var].map(split_val)
@@ -1052,16 +1076,26 @@ def main() -> None:
 
     else:
         st.header("Режим 2: группа на группу")
+        st.caption(
+            "**Нет ответа** = ячейка без текста: пропуск в Excel, пустая строка или только пробелы. "
+            "Для столбца варианта («смотрели ТВ» и т.п.): нет текста = не выбрали вариант; есть текст = выбрали. "
+            "В группах используйте **«— Пропуск —»** для «нет ответа». Пример: эталон «не смотрели» → целевая **«— Пропуск —»**, взвешиваемые «смотрели» → метка из непустой ячейки."
+        )
         split_var = st.selectbox("Переменная-разделитель", options=list(survey.columns))
         vals = survey[split_var].unique()
         cat_list: list[str] = []
-        has_na = bool(survey[split_var].isna().any())
+
+        def _ui_cat(v: Any) -> str:
+            if is_no_text_cell(v):
+                return "— Пропуск —"
+            if isinstance(v, str):
+                return v.strip()
+            return str(v).strip()
+
+        any_no_text = bool(survey[split_var].map(is_no_text_cell).any())
         for v in vals:
-            if pd.isna(v):
-                cat_list.append("— Пропуск —")
-            else:
-                cat_list.append(str(v).strip())
-        if has_na and "— Пропуск —" not in cat_list:
+            cat_list.append(_ui_cat(v))
+        if any_no_text and "— Пропуск —" not in cat_list:
             cat_list.append("— Пропуск —")
         cat_list = sorted(set(cat_list), key=lambda x: (x != "— Пропуск —", natural_sort_key(x)))
 
