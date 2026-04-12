@@ -108,6 +108,18 @@ def survey_cell_stratum_label(x: Any) -> str:
     return str(x).strip()
 
 
+def stratum_is_proskip_only(s: str) -> bool:
+    """Страта только из пустых соц-дем (__ПРОПУСК__ / варианты с подчёркиваниями); в предпросмотр не выводим, вес не калибруем."""
+    t = str(s).strip()
+    if not t:
+        return False
+    for piece in t.split(","):
+        inner = piece.strip().strip("_").lower().replace("ё", "е")
+        if inner != "пропуск":
+            return False
+    return True
+
+
 def normalize_weights_mean_one(w: np.ndarray) -> np.ndarray:
     """Используется в режиме «группа на группу»."""
     w = np.asarray(w, dtype=float)
@@ -250,6 +262,10 @@ def direct_weights_by_stratum(
     preview_rows: list[dict[str, Any]] = []
 
     for s, idxs in sorted(idx_by_s.items(), key=lambda x: str(x[0])):
+        if stratum_is_proskip_only(s):
+            for i in idxs:
+                w[i] = 1.0
+            continue
         keys_here = []
         seen_k: set[tuple[str, str]] = set()
         for i in idxs:
@@ -458,6 +474,10 @@ def mode1_table_compute(
 
     preview_rows: list[dict[str, Any]] = []
     for s, idxs in sorted(idx_by_s.items(), key=lambda x: str(x[0])):
+        if stratum_is_proskip_only(s):
+            for i in idxs:
+                w[i] = 1.0
+            continue
         seen: set[tuple[str, ...]] = set()
         tgt_share = 0.0
         for i in idxs:
@@ -550,6 +570,9 @@ def mode2_compute(
 
     raw_by_stratum: dict[str, float] = {}
     for s, idx in idx_by_s.items():
+        if stratum_is_proskip_only(s):
+            raw_by_stratum[s] = 1.0
+            continue
         nt = int(is_t.loc[idx].sum())
         nw = int(is_w.loc[idx].sum())
         if nw == 0:
@@ -571,10 +594,15 @@ def mode2_compute(
         return None, None, "Не удалось согласовать веса для всех страт. Попробуйте объединить страты."
 
     w = normalize_weights_mean_one(w)
+    for i in range(n):
+        if stratum_is_proskip_only(str(sk.iloc[i])):
+            w[i] = 1.0
 
     rows = []
     strata = sorted(sk.unique(), key=str)
     for s in strata:
+        if stratum_is_proskip_only(s):
+            continue
         idx = sk[sk == s].index
         nt = int(is_t.loc[idx].sum())
         nw = int(is_w.loc[idx].sum())
