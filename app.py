@@ -35,6 +35,20 @@ RAW_LOW = 0.3
 RAW_HIGH = 2.5
 EXTREME_BG = "background-color: #ffcccc"
 
+# Режим 1, табличный Росстат: фиксированные колонки опроса (первая строка — имена переменных)
+MODE1_STANDARD_SURVEY_QGENDER = "Qgender"
+MODE1_STANDARD_SURVEY_QAGERANGE = "Qagerange"
+MODE1_STANDARD_SURVEY_QCITYSIZE = "Qrucitysize"
+# Сопоставление измерений Росстата → колонка опроса (имена в файле Росстата — типичные варианты)
+MODE1_STANDARD_TABLE_SPEC: list[tuple[tuple[str, ...], str]] = [
+    (("Пол", "пол"), MODE1_STANDARD_SURVEY_QGENDER),
+    (("Возраст", "возраст"), MODE1_STANDARD_SURVEY_QAGERANGE),
+    (
+        ("Тип населённого пункта", "Тип НП", "тип населенного пункта"),
+        MODE1_STANDARD_SURVEY_QCITYSIZE,
+    ),
+]
+
 
 def _init_session() -> None:
     defaults = {
@@ -133,6 +147,79 @@ def survey_cell_stratum_label(x: Any) -> str:
     if isinstance(x, str):
         return x.strip()
     return str(x).strip()
+
+
+def category_label_for_ui(x: Any) -> str:
+    """Читаемая подпись категории для списков (Excel часто даёт 1.0 вместо 1)."""
+    if is_no_text_cell(x):
+        return ""
+    if isinstance(x, (float, np.floating)):
+        if not np.isfinite(float(x)):
+            return ""
+        xf = float(x)
+        if xf.is_integer():
+            return str(int(xf))
+        return str(x).strip()
+    if isinstance(x, (int, np.integer)):
+        return str(int(x))
+    if isinstance(x, str):
+        return x.strip()
+    return str(x).strip()
+
+
+def _find_rosstat_dim_column(df: pd.DataFrame, aliases: tuple[str, ...]) -> Optional[str]:
+    for c in df.columns:
+        sc = str(c).strip()
+        for a in aliases:
+            if sc == a or normalize_key(sc) == normalize_key(a):
+                return c
+    return None
+
+
+def resolve_mode1_standard_table(
+    ros: pd.DataFrame, survey: pd.DataFrame
+) -> tuple[Optional[list[str]], Optional[dict[str, str]], Optional[str]]:
+    """Три измерения Росстата и фиксированные Qgender / Qagerange / Qrucitysize в опросе."""
+    ros_dims: list[str] = []
+    survey_map: dict[str, str] = {}
+    missing_ros: list[str] = []
+    missing_sur: list[str] = []
+    for aliases, s_col in MODE1_STANDARD_TABLE_SPEC:
+        rcol = _find_rosstat_dim_column(ros, aliases)
+        if rcol is None:
+            missing_ros.append(aliases[0])
+            continue
+        if s_col not in survey.columns:
+            missing_sur.append(s_col)
+            continue
+        ros_dims.append(rcol)
+        survey_map[rcol] = s_col
+    if missing_ros or missing_sur or len(ros_dims) != 3:
+        parts: list[str] = []
+        if missing_ros:
+            parts.append("в файле Росстата не найдены колонки: " + ", ".join(missing_ros))
+        if missing_sur:
+            parts.append("в опросе нет колонок: " + ", ".join(missing_sur))
+        return None, None, "Стандартное сопоставление недоступно. " + "; ".join(parts) + "."
+    return ros_dims, survey_map, None
+
+
+def _unique_ui_categories(series: pd.Series) -> list[str]:
+    u: set[str] = set()
+    for x in series.dropna():
+        lab = category_label_for_ui(x)
+        if lab:
+            u.add(lab)
+    return sorted(u, key=natural_sort_key)
+
+
+def _norm_keys_for_merged_groups(dim: str, groups: list[list[str]] | None) -> set[str]:
+    out: set[str] = set()
+    for g in groups or []:
+        for x in g:
+            out.add(normalize_key(category_label_for_ui(x)))
+            out.add(normalize_key(str(x).strip()))
+    return out
 
 
 def stratum_is_proskip_only(s: str) -> bool:
@@ -1047,28 +1134,37 @@ def render_mode1_dim_merge_table(
     st.subheader("Укрупнение категорий Росстата")
     st.caption(
         "Выберите измерение и несколько категорий, которые нужно слить в одну целевую группу "
-        "(численности в Росстате суммируются). **Предпросмотр** строится по укрупнённым ячейкам; вес одинаковый внутри ячейки. "
-        "Названия должны совпадать с опросом с учётом нормализации."
+        "(численности в Росстате суммируются). Уже вошедшие в группы категории в списке не показываются. "
+        "**Предпросмотр** — по укрупнённым ячейкам; вес одинаковый внутри ячейки."
     )
 
     dim = st.selectbox(
         "Измерение для укрупнения",
         options=list(weight_vars),
+        format_func=lambda v: f"{v} → {survey_col_map.get(v, '')}",
         key="m1_dim_table_dim",
     )
 
-    excl = set(normalize_key(x) for x in (exclude_values.get(dim, []) or []))
-    rvals = ros[dim].dropna().astype(str).unique().tolist()
+    excl = {normalize_key(x) for x in (exclude_values.get(dim, []) or [])}
+    merged_taken = _norm_keys_for_merged_groups(dim, mg.get(dim, []))
+
+    rlist = _unique_ui_categories(ros[dim])
     scol = survey_col_map.get(dim)
-    svals = survey[scol].dropna().astype(str).unique().tolist() if scol in survey.columns else []
-    opt_set = {str(x).strip() for x in rvals + svals if str(x).strip()}
+    slist = _unique_ui_categories(survey[scol]) if scol in survey.columns else []
+    opt_set: set[str] = set()
+    for o in rlist + slist:
+        nk = normalize_key(o)
+        if nk in excl:
+            continue
+        if nk in merged_taken:
+            continue
+        opt_set.add(o)
     options = sorted(opt_set, key=natural_sort_key)
-    options = [o for o in options if normalize_key(o) not in excl]
 
     pick = st.multiselect(
-        f"Категории «{dim}» в одну группу",
+        f"Категории для объединения ({dim})",
         options=options,
-        key="m1_dim_table_pick",
+        key=f"m1_dim_table_pick_{stable_key(str(dim))}",
     )
     if st.button("Добавить объединение", key="m1_dim_table_add"):
         if len(pick) >= 2:
@@ -1356,78 +1452,80 @@ def main() -> None:
                         st.rerun()
 
         else:
-            cand = [c for c in ros.columns if str(c).lower() not in TARGET_COL_CANDIDATES]
-            tgt_col = _pick_target_col(ros)
-            if tgt_col and tgt_col in cand:
-                cand = [c for c in cand if c != tgt_col]
-
-            st.subheader("Группы Росстата, не участвующие в расчёте")
-            for v in cand:
-                vals = ros[v].dropna().astype(str).unique().tolist()
-                if vals:
-                    exclude_long[v] = st.multiselect(
-                        f"Исключить значения в «{v}»",
-                        options=sorted(vals, key=natural_sort_key),
-                        key=f"ex_{v}",
-                    )
-
-            weight_vars = st.multiselect(
-                "Переменные взвешивания (как в файле Росстата)",
-                options=cand,
-                default=cand[: min(3, len(cand))] if cand else [],
-            )
-            st.caption("Для каждой переменной укажите соответствующую колонку в файле опроса.")
-            survey_col_map: dict[str, str] = {}
-            for v in weight_vars:
-                survey_col_map[v] = st.selectbox(
-                    f"Колонка в опросе для «{v}»",
-                    options=list(survey.columns),
-                    key=f"map_{v}",
+            std_wv, std_map, std_err = resolve_mode1_standard_table(ros, survey)
+            if std_err:
+                st.error(std_err)
+                st.caption(
+                    "Ожидаются в Росстате колонки **Пол**, **Возраст**, **Тип населённого пункта** "
+                    "(допускаются близкие названия, например «Тип НП»). "
+                    "В опросе обязательны колонки **Qgender**, **Qagerange**, **Qrucitysize**."
                 )
+            else:
+                weight_vars = std_wv
+                survey_col_map = std_map
 
-            render_mode1_dim_merge_table(ros, weight_vars, survey_col_map, survey, exclude_long)
+                st.subheader("Сопоставление с опросом")
+                st.info(
+                    "Колонки опроса заданы жёстко: **Qgender** (пол), **Qagerange** (возраст), "
+                    "**Qrucitysize** (тип населённого пункта). Соответствующие столбцы Росстата выбираются автоматически."
+                )
+                pairs = " · ".join(f"«{r}» → {survey_col_map[r]}" for r in weight_vars)
+                st.success(f"Найдено сопоставление: {pairs}")
 
-            if st.button("Рассчитать веса (предпросмотр)", key="calc1t"):
-                try:
-                    w, prev, err, warns, infos = mode1_table_compute(
-                        survey,
-                        ros,
-                        weight_vars,
-                        survey_col_map,
-                        st.session_state.merge_edges,
-                        exclude_long,
-                        copy.deepcopy(st.session_state.get("mode1_dim_merge_groups", {})),
-                    )
-                except Exception:
-                    st.error(
-                        "Не удалось выполнить расчёт. Проверьте, что в файле Росстата есть численности или доли "
-                        "и что категории в опросе совпадают по смыслу с категориями в файле Росстата."
-                    )
-                else:
-                    for i in infos:
-                        st.info(i)
-                    for wn in warns:
-                        st.warning(wn)
-                    if err:
-                        st.error(err)
+                exclude_long = {}
+                st.subheader("Группы Росстата, не участвующие в расчёте")
+                for v in weight_vars:
+                    vals = _unique_ui_categories(ros[v])
+                    if vals:
+                        exclude_long[v] = st.multiselect(
+                            f"Исключить значения в «{v}»",
+                            options=vals,
+                            key=f"ex_{stable_key(str(v))}",
+                        )
+
+                render_mode1_dim_merge_table(ros, weight_vars, survey_col_map, survey, exclude_long)
+
+                if st.button("Рассчитать веса (предпросмотр)", key="calc1t"):
+                    try:
+                        w, prev, err, warns, infos = mode1_table_compute(
+                            survey,
+                            ros,
+                            weight_vars,
+                            survey_col_map,
+                            st.session_state.merge_edges,
+                            exclude_long,
+                            copy.deepcopy(st.session_state.get("mode1_dim_merge_groups", {})),
+                        )
+                    except Exception:
+                        st.error(
+                            "Не удалось выполнить расчёт. Проверьте, что в файле Росстата есть численности или доли "
+                            "и что категории в опросе совпадают по смыслу с категориями в файле Росстата."
+                        )
                     else:
-                        st.session_state.merge_edges = []
-                        st.session_state.weights = w
-                        st.session_state.preview_df = prev
-                        st.session_state.preview_baseline = prev.copy()
-                        st.session_state.preview_mode = 1
-                        st.session_state.mode1_recalc = {
-                            "kind": "table",
-                            "weight_vars": list(weight_vars),
-                            "survey_col_map": dict(survey_col_map),
-                            "exclude_long": {k: list(v) for k, v in exclude_long.items()},
-                            "dim_merge_groups": copy.deepcopy(
-                                st.session_state.get("mode1_dim_merge_groups", {})
-                            ),
-                        }
-                        st.session_state.last_warnings = warns
-                        st.session_state.last_info = infos
-                        st.rerun()
+                        for i in infos:
+                            st.info(i)
+                        for wn in warns:
+                            st.warning(wn)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.session_state.merge_edges = []
+                            st.session_state.weights = w
+                            st.session_state.preview_df = prev
+                            st.session_state.preview_baseline = prev.copy()
+                            st.session_state.preview_mode = 1
+                            st.session_state.mode1_recalc = {
+                                "kind": "table",
+                                "weight_vars": list(weight_vars),
+                                "survey_col_map": dict(survey_col_map),
+                                "exclude_long": {k: list(v) for k, v in exclude_long.items()},
+                                "dim_merge_groups": copy.deepcopy(
+                                    st.session_state.get("mode1_dim_merge_groups", {})
+                                ),
+                            }
+                            st.session_state.last_warnings = warns
+                            st.session_state.last_info = infos
+                            st.rerun()
 
         prev1 = st.session_state.preview_df
         if prev1 is not None and st.session_state.get("preview_mode") == 1:
