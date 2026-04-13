@@ -176,30 +176,52 @@ def _find_rosstat_dim_column(df: pd.DataFrame, aliases: tuple[str, ...]) -> Opti
     return None
 
 
+def _survey_column_for_standard_var(survey: pd.DataFrame, std_name: str) -> Optional[str]:
+    """Колонка в df по метке режима 1 (Qgender и т.д.) в строке файла над заголовком переменных."""
+    want = std_name.strip()
+    row = survey.attrs.get("survey_var_row") or []
+    for j, cell in enumerate(row):
+        if j >= len(survey.columns):
+            break
+        if is_no_text_cell(cell):
+            continue
+        lab = str(cell).strip()
+        if lab == want or normalize_key(lab) == normalize_key(want):
+            return str(survey.columns[j])
+    if want in survey.columns:
+        return want
+    return None
+
+
 def resolve_mode1_standard_table(
     ros: pd.DataFrame, survey: pd.DataFrame
 ) -> tuple[Optional[list[str]], Optional[dict[str, str]], Optional[str]]:
-    """Три измерения Росстата и фиксированные Qgender / Qagerange / Qrucitysize в опросе."""
+    """Три измерения Росстата (как сейчас) и Qgender / Qagerange / Qrucitysize в первой строке опроса над заголовком."""
     ros_dims: list[str] = []
     survey_map: dict[str, str] = {}
     missing_ros: list[str] = []
     missing_sur: list[str] = []
-    for aliases, s_col in MODE1_STANDARD_TABLE_SPEC:
+    for aliases, std_var in MODE1_STANDARD_TABLE_SPEC:
         rcol = _find_rosstat_dim_column(ros, aliases)
         if rcol is None:
             missing_ros.append(aliases[0])
             continue
-        if s_col not in survey.columns:
-            missing_sur.append(s_col)
+        scol = _survey_column_for_standard_var(survey, std_var)
+        if scol is None:
+            missing_sur.append(std_var)
             continue
         ros_dims.append(rcol)
-        survey_map[rcol] = s_col
+        survey_map[rcol] = scol
     if missing_ros or missing_sur or len(ros_dims) != 3:
         parts: list[str] = []
         if missing_ros:
             parts.append("в файле Росстата не найдены колонки: " + ", ".join(missing_ros))
         if missing_sur:
-            parts.append("в опросе нет колонок: " + ", ".join(missing_sur))
+            parts.append(
+                "в первой строке опроса (над строкой с названиями колонок) нет меток: "
+                + ", ".join(missing_sur)
+                + " (либо совпадения с именем колонки во второй строке)"
+            )
         return None, None, "Стандартное сопоставление недоступно. " + "; ".join(parts) + "."
     return ros_dims, survey_map, None
 
@@ -236,10 +258,29 @@ def stratum_is_proskip_only(s: str) -> bool:
 
 def load_survey_excel(uploaded: Any, header_row: int) -> pd.DataFrame:
     uploaded.seek(0)
-    df = pd.read_excel(uploaded, sheet_name=0, header=int(header_row))
+    hr = int(header_row)
+    df = pd.read_excel(uploaded, sheet_name=0, header=hr)
+    survey_var_row: list[str] = []
+    if hr >= 1:
+        uploaded.seek(0)
+        raw_top = pd.read_excel(uploaded, sheet_name=0, header=None, nrows=hr)
+        ncols = len(df.columns)
+        if len(raw_top) > hr - 1:
+            arr = raw_top.iloc[hr - 1].values
+            for j in range(ncols):
+                if j < len(arr):
+                    v = arr[j]
+                    survey_var_row.append("" if pd.isna(v) else str(v).strip())
+                else:
+                    survey_var_row.append("")
+        else:
+            survey_var_row = [""] * ncols
+    else:
+        survey_var_row = [""] * len(df.columns)
     leading = count_leading_fully_empty_rows(df)
     df = drop_fully_empty_rows(df)
     df.attrs["leading_fully_empty_rows"] = leading
+    df.attrs["survey_var_row"] = survey_var_row
     return df
 
 
@@ -1239,7 +1280,7 @@ def build_excel_with_wt(
     weights: np.ndarray,
     leading_empty_rows: int = 0,
 ) -> bytes:
-    """Добавляет столбец WT в конец листа, не изменяя существующие ячейки (включая строки над заголовком).
+    """Добавляет столбец весов в конец листа: при двухстрочном заголовке — «WT» над строкой имён, «веса» в строке заголовков.
 
     leading_empty_rows — сколько полностью пустых строк шло сразу под заголовком в исходном файле;
     их мы не загружаем в DataFrame, поэтому первый вес сдвигается на столько строк вниз.
@@ -1250,11 +1291,16 @@ def build_excel_with_wt(
     if ws is None:
         raise ValueError("Пустая книга Excel.")
 
-    hdr = int(header_row) + 1
+    hr = int(header_row)
+    hdr = hr + 1
     max_c = ws.max_column or 1
 
     wt_col = max_c + 1
-    ws.cell(row=hdr, column=wt_col, value="WT")
+    if hr >= 1:
+        ws.cell(row=hdr - 1, column=wt_col, value="WT")
+        ws.cell(row=hdr, column=wt_col, value="веса")
+    else:
+        ws.cell(row=hdr, column=wt_col, value="веса")
 
     w = np.asarray(weights, dtype=float).ravel()
     skip = max(0, int(leading_empty_rows))
@@ -1269,7 +1315,9 @@ def build_excel_with_wt(
 
 def export_fallback_dataframe(survey_df: pd.DataFrame, weights: np.ndarray) -> bytes:
     out = survey_df.copy()
-    out["WT"] = weights
+    n = len(out.columns)
+    out.columns = pd.MultiIndex.from_arrays([list(out.columns), [""] * n])
+    out[("WT", "веса")] = weights
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out.to_excel(writer, index=False)
@@ -1294,7 +1342,7 @@ def main() -> None:
             max_value=50,
             value=int(st.session_state.survey_header_row) + 1,
             step=1,
-            help="Номер строки в Excel, где указаны имена переменных. Чаще всего это вторая строка (укажите 2).",
+            help="Номер строки в Excel, по которой pandas называет колонки (часто 2). Строка **над ней** (например, 1) может содержать коды **Qgender**, **Qagerange**, **Qrucitysize** для табличного режима Росстата — сопоставление идёт по ним, имена колонок могут быть любыми.",
         )
         header_row = int(hdr) - 1
 
@@ -1456,9 +1504,10 @@ def main() -> None:
             if std_err:
                 st.error(std_err)
                 st.caption(
-                    "Ожидаются в Росстате колонки **Пол**, **Возраст**, **Тип населённого пункта** "
-                    "(допускаются близкие названия, например «Тип НП»). "
-                    "В опросе обязательны колонки **Qgender**, **Qagerange**, **Qrucitysize**."
+                    "В Росстате — колонки **Пол**, **Возраст**, **Тип населённого пункта** "
+                    "(допускаются близкие названия). В опросе в **первой строке файла** (над строкой с названиями колонок) "
+                    "должны быть ячейки **Qgender**, **Qagerange**, **Qrucitysize** в тех же столбцах; "
+                    "если их нет — допускается совпадение с именем колонки во второй строке."
                 )
             else:
                 weight_vars = std_wv
@@ -1466,8 +1515,9 @@ def main() -> None:
 
                 st.subheader("Сопоставление с опросом")
                 st.info(
-                    "Колонки опроса заданы жёстко: **Qgender** (пол), **Qagerange** (возраст), "
-                    "**Qrucitysize** (тип населённого пункта). Соответствующие столбцы Росстата выбираются автоматически."
+                    "Поля **Qgender** / **Qagerange** / **Qrucitysize** ищутся в **первой строке** листа опроса "
+                    "(над строкой с названиями колонок); данные читаются по колонкам со второй строки, как раньше. "
+                    "Столбцы Росстата подставляются автоматически."
                 )
                 pairs = " · ".join(f"«{r}» → {survey_col_map[r]}" for r in weight_vars)
                 st.success(f"Найдено сопоставление: {pairs}")
