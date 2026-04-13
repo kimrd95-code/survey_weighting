@@ -348,58 +348,72 @@ def check_and_normalize_target_shares(pt_map: dict[tuple[str, str], float], info
     return pt_map
 
 
-def direct_weights_by_stratum(
+def _format_mode1_cell_key(k: tuple[str, ...]) -> str:
+    if len(k) == 2:
+        return f"«{k[0]} / {k[1]}»"
+    return "«" + " | ".join(str(x) for x in k) + "»"
+
+
+def direct_weights_mode1_poststrat(
     n: int,
     stratum_per_row: list[str],
-    row_cell_keys: list[tuple[str, str]],
-    pt_map: dict[tuple[str, str], float],
+    row_cell_keys: list[tuple[str, ...]],
+    pt_map: dict[tuple[str, ...], float],
 ) -> tuple[np.ndarray, list[dict[str, Any]], list[str], list[str]]:
-    """Прямой вес по укрупнённой страте: сумма целевых долей по уникальным ячейкам внутри страты / фактическая доля страты."""
+    """Вес и предпросмотр по **ключу целевой ячейки** (как в Росстате после укрупнения измерений), а не по сырой склейке колонок опроса.
+
+    Иначе при слиянии, например, Москвы и СПб одинаковая целевая доля ошибочно делилась бы на разные фактические доли подгрупп.
+    """
     warns: list[str] = []
     infos: list[str] = []
-    idx_by_s: dict[str, list[int]] = {}
-    for i in range(n):
-        s = stratum_per_row[i]
-        idx_by_s.setdefault(s, []).append(i)
-
     w = np.ones(n, dtype=float)
     preview_rows: list[dict[str, Any]] = []
 
-    for s, idxs in sorted(idx_by_s.items(), key=lambda x: str(x[0])):
+    idx_proskip: dict[str, list[int]] = {}
+    idx_by_cell: dict[tuple[str, ...], list[int]] = {}
+    for i in range(n):
+        s = str(stratum_per_row[i])
         if stratum_is_proskip_only(s):
-            for i in idxs:
-                w[i] = 1.0
-            continue
-        keys_here = []
-        seen_k: set[tuple[str, str]] = set()
-        for i in idxs:
+            idx_proskip.setdefault(s, []).append(i)
+        else:
             k = row_cell_keys[i]
-            if k not in seen_k:
-                seen_k.add(k)
-                keys_here.append(k)
+            idx_by_cell.setdefault(k, []).append(i)
 
-        tgt_share = 0.0
-        missing_any = False
-        for k in keys_here:
-            if k in pt_map:
-                tgt_share += float(pt_map[k])
-            else:
-                missing_any = True
-                if k[0] or k[1]:
-                    warns.append(
-                        "Не найдено соответствие между категориями в данных и целевом файле "
-                        f"для сочетания «{k[0]} / {k[1]}»."
-                    )
-
+    for s, idxs in sorted(idx_proskip.items(), key=lambda x: str(x[0])):
+        for i in idxs:
+            w[i] = 1.0
         n_s = len(idxs)
         p_a = n_s / n if n else 0.0
-        if missing_any and tgt_share == 0 and n_s > 0:
+        preview_rows.append(
+            {
+                "stratum": s,
+                "n": n_s,
+                "share_act": p_a,
+                "share_tgt": 0.0,
+                "raw_w": 1.0,
+            }
+        )
+
+    for k, idxs in sorted(idx_by_cell.items(), key=lambda x: str(x[0])):
+        tgt_share = float(pt_map.get(k, 0.0))
+        missing = k not in pt_map
+        if missing and any(k):
+            warns.append(
+                "Не найдено соответствие между категориями в данных и целевом файле "
+                f"для сочетания {_format_mode1_cell_key(k)}."
+            )
+
+        n_k = len(idxs)
+        p_a = n_k / n if n else 0.0
+        cell_label = " | ".join(str(x) for x in k)
+
+        if missing and tgt_share == 0 and n_k > 0:
             for i in idxs:
                 w[i] = np.nan
             preview_rows.append(
                 {
-                    "stratum": s,
-                    "n": n_s,
+                    "stratum": cell_label,
+                    "n": n_k,
                     "share_act": p_a,
                     "share_tgt": 0.0,
                     "raw_w": np.nan,
@@ -409,21 +423,23 @@ def direct_weights_by_stratum(
 
         if p_a <= 0:
             continue
-        raw_w = tgt_share / p_a if tgt_share > 0 else (0.0 if n_s == 0 else np.nan)
-        if tgt_share == 0 and n_s > 0:
+
+        if tgt_share <= 0 and n_k > 0:
             warns.append(
-                f"Для ячейки «{s}» в целевом распределении доля равна нулю, но в выборке есть респонденты."
+                f"Для ячейки {_format_mode1_cell_key(k)} в целевом распределении доля равна нулю, но в выборке есть респонденты."
             )
+            raw_w = np.nan
             for i in idxs:
                 w[i] = np.nan
         else:
+            raw_w = tgt_share / p_a if tgt_share > 0 else (0.0 if n_k == 0 else np.nan)
             for i in idxs:
                 w[i] = raw_w
 
         preview_rows.append(
             {
-                "stratum": s,
-                "n": n_s,
+                "stratum": cell_label,
+                "n": n_k,
                 "share_act": p_a,
                 "share_tgt": tgt_share,
                 "raw_w": float(raw_w) if np.isfinite(raw_w) else np.nan,
@@ -489,7 +505,7 @@ def mode1_matrix_compute(
     stratum_per_row = d["_sk"].astype(str).tolist()
     row_cell_keys = list(zip(d["_kr"].tolist(), d["_kc"].tolist()))
 
-    w, preview_list, warns2, infos2 = direct_weights_by_stratum(
+    w, preview_list, warns2, infos2 = direct_weights_mode1_poststrat(
         n, stratum_per_row, row_cell_keys, pt_map
     )
     warns.extend(warns2)
@@ -604,48 +620,9 @@ def mode1_table_compute(
         if key not in jkeys and any(key):
             warns.append("Не найдено соответствие для части категорий в данных и целевом файле.")
 
-    w = np.ones(n, dtype=float)
-    idx_by_s: dict[str, list[int]] = {}
-    for i in range(n):
-        idx_by_s.setdefault(stratum_per_row[i], []).append(i)
-
-    preview_rows: list[dict[str, Any]] = []
-    for s, idxs in sorted(idx_by_s.items(), key=lambda x: str(x[0])):
-        if stratum_is_proskip_only(s):
-            for i in idxs:
-                w[i] = 1.0
-            continue
-        seen: set[tuple[str, ...]] = set()
-        tgt_share = 0.0
-        for i in idxs:
-            k = row_cell_keys[i]
-            if k not in seen:
-                seen.add(k)
-                tgt_share += float(pt_map.get(k, 0.0))
-        n_s = len(idxs)
-        p_a = n_s / n if n else 0.0
-        if p_a <= 0:
-            continue
-        if tgt_share <= 0 and n_s > 0:
-            warns.append(
-                f"Для ячейки «{s}» в целевом распределении доля равна нулю, но в выборке есть респонденты."
-            )
-            for i in idxs:
-                w[i] = np.nan
-            raw_w = np.nan
-        else:
-            raw_w = tgt_share / p_a
-            for i in idxs:
-                w[i] = raw_w
-        preview_rows.append(
-            {
-                "stratum": s,
-                "n": n_s,
-                "share_act": p_a,
-                "share_tgt": tgt_share,
-                "raw_w": float(raw_w) if np.isfinite(raw_w) else np.nan,
-            }
-        )
+    w, preview_rows, warns2, infos2 = direct_weights_mode1_poststrat(n, stratum_per_row, row_cell_keys, pt_map)
+    warns.extend(warns2)
+    infos.extend(infos2)
 
     if np.any(~np.isfinite(w)):
         return (
@@ -1003,7 +980,8 @@ def render_mode1_dim_merge_table(
     st.subheader("Укрупнение категорий Росстата")
     st.caption(
         "Выберите измерение и несколько категорий, которые нужно слить в одну целевую группу "
-        "(численности в Росстате суммируются). Названия должны совпадать с опросом с учётом нормализации."
+        "(численности в Росстате суммируются). **Предпросмотр** строится по укрупнённым ячейкам; вес одинаковый внутри ячейки. "
+        "Названия должны совпадать с опросом с учётом нормализации."
     )
 
     dim = st.selectbox(
